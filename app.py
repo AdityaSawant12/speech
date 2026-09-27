@@ -84,34 +84,87 @@ def save_uploaded_file(uploaded_file):
 
 @st.cache_resource(show_spinner=False)
 def _load_spacy():
-    """Load spaCy model once; auto-download en_core_web_sm if missing."""
+    """Load spaCy multilingual model (xx_ent_wiki_sm) once; auto-download if missing.
+    Falls back to en_core_web_sm if the multilingual model is unavailable.
+    """
     try:
         import spacy
-        try:
-            return spacy.load("en_core_web_sm")
-        except OSError:
-            from spacy.cli import download as spacy_download
-            spacy_download("en_core_web_sm")
-            return spacy.load("en_core_web_sm")
+        # Try multilingual model first (free, covers 40+ languages)
+        for model_name in ("xx_ent_wiki_sm", "en_core_web_sm"):
+            try:
+                return spacy.load(model_name)
+            except OSError:
+                try:
+                    from spacy.cli import download as spacy_download
+                    spacy_download(model_name)
+                    return spacy.load(model_name)
+                except Exception:
+                    continue
     except Exception:
-        return None
+        pass
+    return None
+
+
+def _detect_and_translate(text: str, target: str = "en") -> tuple:
+    """Detect language of text and translate to English using Google Translate
+    (via deep-translator — free, no API key, requires internet).
+    Returns (translated_text, detected_lang_code).
+    """
+    detected = "en"
+    translated = text
+
+    # ── Detect language ────────────────────────────────────────────────────
+    try:
+        from langdetect import detect
+        detected = detect(text[:500])
+    except Exception:
+        pass
+
+    if detected == target:
+        return text, detected
+
+    # ── Translate via Google (free, no key) ────────────────────────────────
+    try:
+        from deep_translator import GoogleTranslator
+        chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
+        translated_parts = []
+        for chunk in chunks:
+            t = GoogleTranslator(source="auto", target=target).translate(chunk)
+            translated_parts.append(t or chunk)
+        translated = " ".join(translated_parts)
+    except Exception:
+        translated = text
+
+    return translated, detected
 
 
 def _sentiment(text: str) -> dict:
-    """Return polarity, subjectivity and a label via TextBlob."""
+    """Multilingual sentiment: auto-detects language, translates to English via
+    free Google Translate (deep-translator, no API key), then analyses with TextBlob.
+    Supports 100+ languages — zero large model downloads required.
+    """
     try:
+        translated, detected = _detect_and_translate(text)
         from textblob import TextBlob
-        blob = TextBlob(text)
-        pol = blob.sentiment.polarity        # -1 ... +1
-        sub = blob.sentiment.subjectivity    #  0 ... 1
+        blob = TextBlob(translated)
+        pol = blob.sentiment.polarity
+        sub = blob.sentiment.subjectivity
         if pol > 0.05:
             label, emoji, color = "Positive", "\U0001f60a", "#2ecc71"
         elif pol < -0.05:
             label, emoji, color = "Negative", "\U0001f61f", "#e74c3c"
         else:
             label, emoji, color = "Neutral", "\U0001f610", "#f39c12"
-        return {"polarity": pol, "subjectivity": sub,
-                "label": label, "emoji": emoji, "color": color}
+        if detected == "en":
+            model_note = "TextBlob"
+        else:
+            model_note = f"Google Translate ({detected}\u2192en) + TextBlob"
+        return {
+            "polarity": pol, "subjectivity": sub,
+            "label": label, "emoji": emoji, "color": color,
+            "confidence": None, "model": model_note,
+            "detected_lang": detected,
+        }
     except Exception as exc:
         return {"error": str(exc)}
 
@@ -131,11 +184,12 @@ def _spacy_label_desc(label: str) -> str:
 
 
 def _ner(text: str) -> list:
-    """Return deduplicated list of entity dicts using spaCy."""
+    """Multilingual NER: translates text to English first, then runs spaCy."""
+    translated, _ = _detect_and_translate(text)
     nlp = _load_spacy()
     if nlp is None:
         return []
-    doc = nlp(text)
+    doc = nlp(translated)
     seen = set()
     entities = []
     for ent in doc.ents:
@@ -150,12 +204,26 @@ def _ner(text: str) -> list:
     return entities
 
 
-def _keywords(text: str, n: int = 10) -> list:
-    """Return top-n (keyword, relevance 0-100) pairs using YAKE."""
+# ISO 639-1 code → YAKE language string mapping (covers common languages)
+_YAKE_LANG_MAP = {
+    "en": "en", "hi": "hi", "mr": "mr", "ta": "ta", "te": "te",
+    "kn": "kn", "bn": "bn", "gu": "gu", "es": "es", "fr": "fr",
+    "de": "de", "pt": "pt", "it": "it", "nl": "nl", "pl": "pl",
+    "ar": "ar", "zh": "zh", "ja": "ja", "ko": "ko", "ru": "ru",
+    "tr": "tr", "uk": "uk", "sv": "sv", "fi": "fi", "da": "da",
+    "no": "no", "cs": "cs", "ro": "ro", "hu": "hu", "id": "id",
+}
+
+
+def _keywords(text: str, n: int = 10, lang: str = "en") -> list:
+    """Return top-n (keyword, relevance 0-100) pairs using YAKE.
+    Accepts ISO 639-1 language code so extraction works for all languages.
+    """
     try:
         import yake
+        yake_lang = _YAKE_LANG_MAP.get(lang, "en")
         kw_extractor = yake.KeywordExtractor(
-            lan="en", n=2, dedupLim=0.7, top=n, features=None
+            lan=yake_lang, n=2, dedupLim=0.7, top=n, features=None
         )
         keywords = kw_extractor.extract_keywords(text)
         if not keywords:
@@ -170,7 +238,7 @@ def _keywords(text: str, n: int = 10) -> list:
 # NLP panel rendered after every transcription
 # ─────────────────────────────────────────────
 
-def nlp_panel(text: str, key_prefix: str = ""):
+def nlp_panel(text: str, key_prefix: str = "", lang: str = "en"):
     """Render Sentiment / NER / Keywords analysis tabs for a transcript."""
     if not text or not text.strip():
         return
@@ -184,13 +252,21 @@ def nlp_panel(text: str, key_prefix: str = ""):
 
     # ── Sentiment ─────────────────────────────
     with nlp_t1:
-        with st.spinner("Analysing sentiment..."):
+        with st.spinner("Analysing sentiment (multilingual)..."):
             result = _sentiment(text)
 
         if "error" in result:
             st.warning(f"Sentiment analysis unavailable: {result['error']}")
-            st.info("Run `pip install textblob` and restart Streamlit.")
+            st.info(
+                "Install with:\n```\npip install transformers torch\n```\n"
+                "or `pip install textblob` as a fallback (English only)."
+            )
         else:
+            # Show which model was used
+            model_used = result.get("model", "")
+            if model_used:
+                st.caption(f"🤖 Model: **{model_used}**")
+
             col_a, col_b, col_c = st.columns(3)
             with col_a:
                 st.metric("Overall Sentiment",
@@ -200,9 +276,14 @@ def nlp_panel(text: str, key_prefix: str = ""):
                           f"{result['polarity']:+.3f}",
                           help="Range: -1 (most negative) to +1 (most positive)")
             with col_c:
-                st.metric("Subjectivity",
-                          f"{result['subjectivity']:.3f}",
-                          help="0 = fully objective, 1 = fully subjective")
+                if result.get("confidence") is not None:
+                    st.metric("Confidence",
+                              f"{result['confidence']:.1%}",
+                              help="Model confidence in the predicted sentiment label")
+                elif result.get("subjectivity") is not None:
+                    st.metric("Subjectivity",
+                              f"{result['subjectivity']:.3f}",
+                              help="0 = fully objective, 1 = fully subjective")
 
             st.markdown("**Polarity gauge** (Negative ← | → Positive)")
             filled = int((result["polarity"] + 1) / 2 * 20)
@@ -219,18 +300,19 @@ def nlp_panel(text: str, key_prefix: str = ""):
 
     # ── NER ───────────────────────────────────
     with nlp_t2:
-        with st.spinner("Extracting named entities..."):
+        with st.spinner("Extracting named entities (multilingual)..."):
             entities = _ner(text)
 
         if not entities:
             st.info(
-                "No named entities found, or spaCy model is unavailable.\n\n"
+                "No named entities found, or spaCy multilingual model is unavailable.\n\n"
                 "Install with:\n```\npip install spacy\n"
-                "python -m spacy download en_core_web_sm\n```"
+                "python -m spacy download xx_ent_wiki_sm\n```"
             )
         else:
             import pandas as pd
             df_ent = pd.DataFrame(entities)
+            st.caption("🌐 Using spaCy multilingual NER model (`xx_ent_wiki_sm`)")
             st.markdown(f"**{len(entities)} unique entities found**")
             st.dataframe(df_ent, use_container_width=True, hide_index=True)
 
@@ -243,8 +325,8 @@ def nlp_panel(text: str, key_prefix: str = ""):
     with nlp_t3:
         n_kw = st.slider("Number of keywords", 5, 20, 10,
                          key=f"{key_prefix}_kw_slider")
-        with st.spinner("Extracting keywords..."):
-            keywords = _keywords(text, n=n_kw)
+        with st.spinner(f"Extracting keywords (lang={lang})..."):
+            keywords = _keywords(text, n=n_kw, lang=lang)
 
         if not keywords or str(keywords[0][0]).startswith("Error"):
             st.info(
@@ -252,6 +334,7 @@ def nlp_panel(text: str, key_prefix: str = ""):
                 "Install YAKE with:\n```\npip install yake\n```"
             )
         else:
+            st.caption(f"🌐 YAKE keyword extraction — language: `{lang}`")
             st.markdown(f"**Top {len(keywords)} keywords / phrases (YAKE)**")
             for rank, (kw, score) in enumerate(keywords, 1):
                 col1, col2 = st.columns([4, 1])
@@ -349,7 +432,8 @@ with tab1:
                         st.dataframe(df, use_container_width=True)
 
                 # ── NLP panel ──
-                nlp_panel(text, key_prefix="file")
+                detected_lang = getattr(info, "language", "en") or "en"
+                nlp_panel(text, key_prefix="file", lang=detected_lang)
 
             except Exception as e:
                 st.error(f"Transcription failed: {e}")
@@ -415,7 +499,8 @@ with tab2:
                     )
 
                     # ── NLP panel ──
-                    nlp_panel(text, key_prefix="mic")
+                    detected_lang = getattr(info, "language", live_language or "en") or "en"
+                    nlp_panel(text, key_prefix="mic", lang=detected_lang)
 
                 except Exception as e:
                     st.error(f"Microphone transcription failed: {e}")

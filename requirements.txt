@@ -5,3 +5,6 @@ pandas>=2.2,<3
 textblob>=0.18,<1
 spacy>=3.7,<4
 yake>=0.4.8
+# Multilingual NLP (free, no API key, ~300 KB install, no large model download)
+langdetect>=1.0.9
+deep-translator>=1.11
